@@ -392,12 +392,27 @@ def groq_call(system: str, prompt: str) -> str | None:
         return None
 
 
+class Hypothesis(TypedDict):
+    id: str
+    statement: str
+    outcome: str
+    article: str
+    confidence: float
+    evidence_quote: str
+    status: str
+    rejection_reason: str
+
+
 class GraphState(TypedDict, total=False):
     title: str
     category: str
     text: str
     retrieval: dict[str, Any]
     assessment: dict[str, Any]
+    hypotheses: list[Hypothesis]
+    evaluated_hypotheses: Annotated[list[Hypothesis], operator.add]
+    selected_hypothesis: Hypothesis
+    rejected_hypotheses: list[Hypothesis]
     risk_score: int
     risk_level: str
     classification: str
@@ -435,11 +450,317 @@ def explain_step(node: str, summary: str, text: str, evidence: str = "") -> dict
     return {"explanation": response or fallback, "generated_by": "groq" if response else "local-fallback"}
 
 
+def legacy_alternatives_from_hypotheses(hypotheses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{
+        "id": item.get("id", f"legacy-alt-{index + 1}"),
+        "hypothesis": item.get("statement", "Hipótese rejeitada"),
+        "rejection_reason": item.get("rejection_reason") or "A hipótese foi rejeitada porque não foi considerada suficientemente suportada pela evidência disponível.",
+        "confidence_score": round(float(item.get("confidence", 0.0)), 3),
+        "cuad_category": item.get("article", ""),
+    } for index, item in enumerate(hypotheses)]
+
+
 def make_step(node: str, title: str, summary: str, risk: str, phase: int, payload: dict[str, Any], alternatives: list[dict[str, Any]], annotation: str, faithfulness: dict[str, Any]) -> dict[str, Any]:
-    return {"step_id": f"py-langgraph-{node}-{phase}", "node_name": node, "type": "decision" if node == "classify_risk" else "audit" if node == "faithfulness_audit" else "synthesis" if node == "verdict_synthesis" else "extraction" if node == "extract_clauses" else "precedent", "title": title, "summary": summary, "generative_annotation": annotation, "risk_level": risk, "scroll_phase": phase, "payload": payload, "alternatives": alternatives, "faithfulness_metadata": faithfulness, "execution_time_ms": 0, "is_critical_node": node in ("classify_risk", "verdict_synthesis")}
+    return {"step_id": f"py-langgraph-{node}-{phase}", "node_name": node, "type": "decision" if node == "classify_risk" else "audit" if node == "faithfulness_audit" else "synthesis" if node == "verdict_synthesis" else "extraction" if node == "extract_clauses" else "precedent", "title": title, "summary": summary, "generative_annotation": annotation, "risk_level": risk, "scroll_phase": phase, "payload": payload, "alternatives": alternatives, "faithfulness_metadata": faithfulness, "execution_time_ms": 0, "is_critical_node": node in ("classify_risk", "verdict_synthesis")} 
+
+
+def validate_hypotheses_payload(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    hypotheses = payload.get("hypotheses")
+    if not isinstance(hypotheses, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in hypotheses:
+        if not isinstance(item, dict):
+            continue
+        statement = str(item.get("statement", "")).strip()
+        outcome = str(item.get("outcome", "")).strip().lower()
+        article = str(item.get("article", "")).strip()
+        evidence_quote = str(item.get("evidence_quote", "")).strip()
+        confidence_raw = item.get("confidence")
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError):
+            continue
+        if not statement or outcome not in {"supports", "contradicts", "unclear"} or not 0.0 <= confidence <= 1.0:
+            continue
+        cleaned.append({
+            "statement": statement,
+            "outcome": outcome,
+            "article": article,
+            "confidence": round(confidence, 3),
+            "evidence_quote": evidence_quote,
+        })
+    return cleaned
+
+
+def deterministic_hypotheses(assessment: dict[str, Any], retrieval: dict[str, Any], clause_text: str) -> list[Hypothesis]:
+    findings = assessment.get("findings", []) or []
+    if not isinstance(findings, list):
+        findings = []
+    supports = [item for item in findings if str(item.get("relationship", "")).lower() in {"supports", "unclear"}]
+    contradicts = [item for item in findings if str(item.get("relationship", "")).lower() == "contradicts"]
+    candidates: list[Hypothesis] = []
+
+    def make_record(article: str, outcome: str, statement: str, evidence: str, confidence: float) -> Hypothesis:
+        return {
+            "id": "",
+            "statement": statement,
+            "outcome": outcome,
+            "article": article,
+            "confidence": round(float(confidence), 3),
+            "evidence_quote": evidence,
+            "status": "candidate",
+            "rejection_reason": "",
+        }
+
+    if contradicts:
+        for finding in contradicts[:2]:
+            clause_quote = (finding.get("contract_excerpt") or finding.get("legal_excerpt") or clause_text).strip()
+            statement = f"A cláusula entra em conflito com o requisito legal em {finding.get('article', retrieval.get('category', 'referencial jurídico'))}."
+            candidates.append(make_record(str(finding.get('article', '')).strip() or retrieval.get('category', 'Referencial jurídico'), 'contradicts', statement, clause_quote[:300], float(finding.get('confidence', 0.7))))
+    if supports:
+        for finding in supports[:2]:
+            clause_quote = (finding.get("contract_excerpt") or finding.get("legal_excerpt") or clause_text).strip()
+            statement = f"A cláusula pode ser interpretada como compatível com {finding.get('article', retrieval.get('category', 'referencial jurídico'))}."
+            candidates.append(make_record(str(finding.get('article', '')).strip() or retrieval.get('category', 'Referencial jurídico'), 'supports', statement, clause_quote[:300], float(finding.get('confidence', 0.6))))
+    if not candidates and findings:
+        first = findings[0]
+        candidates.append(make_record(str(first.get('article', '')).strip() or retrieval.get('category', 'Referencial jurídico'), 'unclear', "A evidência disponível é insuficiente para afirmar com segurança a conformidade ou a incompatibilidade da cláusula.", str(first.get('contract_excerpt') or first.get('legal_excerpt') or clause_text)[:300], max(0.25, float(first.get('confidence', 0.35)))))
+    if not candidates:
+        article = retrieval.get('category', 'Referencial jurídico')
+        candidates.append({
+            "id": "",
+            "statement": "A evidência disponível é insuficiente para concluir a conformidade ou a contradição da cláusula.",
+            "outcome": "unclear",
+            "article": article,
+            "confidence": 0.35,
+            "evidence_quote": (clause_text or retrieval.get('evidence', ''))[:300],
+            "status": "candidate",
+            "rejection_reason": "",
+        })
+
+    deduped: list[Hypothesis] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = "|".join([item["statement"], item["article"], item["outcome"]]).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        item["id"] = ""
+        item["status"] = "candidate"
+        deduped.append(item)
+    return deduped[:5]
+
+
+def normalize_hypothesis(item: dict[str, Any], index: int) -> Hypothesis:
+    statement = str(item.get("statement", "")).strip()
+    outcome = str(item.get("outcome", "")).strip().lower()
+    article = str(item.get("article", "")).strip()
+    confidence = float(item.get("confidence", 0.0))
+    evidence_quote = str(item.get("evidence_quote", "")).strip()
+    if not statement:
+        statement = f"Hipótese jurídica {index + 1}"
+    if outcome not in {"supports", "contradicts", "unclear"}:
+        outcome = "unclear"
+    if not 0.0 <= confidence <= 1.0:
+        confidence = 0.5
+    return {
+        "id": f"hyp-{index + 1}",
+        "statement": statement,
+        "outcome": outcome,
+        "article": article or "Referencial jurídico",
+        "confidence": round(confidence, 3),
+        "evidence_quote": evidence_quote or "Evidência não explicitada no modelo de resposta.",
+        "status": "candidate",
+        "rejection_reason": "",
+    }
+
+
+def generate_hypotheses(state: GraphState):
+    retrieval = state["retrieval"]
+    assessment = state["assessment"]
+    clause_text = state["text"]
+    provider = "deterministic-fallback"
+    hypotheses: list[Hypothesis] = []
+    if os.getenv("GROQ_API_KEY"):
+        structured = None
+        key = os.getenv("GROQ_API_KEY")
+        if key:
+            schema = {
+                "type": "object",
+                "properties": {
+                    "hypotheses": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "statement": {"type": "string", "minLength": 1, "maxLength": 400},
+                                "outcome": {"enum": ["supports", "contradicts", "unclear"]},
+                                "article": {"type": "string", "minLength": 1, "maxLength": 200},
+                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 500},
+                            },
+                            "required": ["statement", "outcome", "article", "confidence", "evidence_quote"],
+                            "additionalProperties": False,
+                        },
+                        "minItems": 1,
+                        "maxItems": 5,
+                    }
+                },
+                "required": ["hypotheses"],
+                "additionalProperties": False,
+            }
+            prompt = (
+                "Analise esta cláusula e os elementos jurídicos disponíveis. "
+                "Use apenas a evidência fornecida e mantenha a resposta concisa e verificável.\n\n"
+                f"Cláusula: {clause_text[:2000]}\n\n"
+                f"Categoria: {retrieval.get('category', 'Referencial jurídico')}\n"
+                f"Evidência legal: {retrieval.get('evidence', '')[:1500]}\n\n"
+                f"Achados determinísticos: {json.dumps(assessment.get('findings', [])[:3], ensure_ascii=False)[:2500]}"
+            )
+            payload = json.dumps({
+                "model": GROQ_MODEL,
+                "temperature": 0.1,
+                "max_tokens": 500,
+                "response_format": {"type": "json_schema", "json_schema": {"name": "hypothesis_set", "schema": schema, "strict": True}},
+                "messages": [
+                    {"role": "system", "content": "Generates only plausible legal hypotheses grounded in the clause and supplied evidence. Do not invent alternatives solely for visual demonstration. Do not expose hidden reasoning or chain-of-thought. Return concise, auditable hypotheses linked to the supplied clause, article, and evidence. Include a conformity hypothesis only if genuinely plausible. Include a contradiction hypothesis only if genuinely plausible. Include an uncertainty hypothesis when the supplied information is insufficient. Return between 2 and 5 hypotheses when more than one interpretation is genuinely supported; otherwise return fewer."},
+                    {"role": "user", "content": prompt},
+                ],
+            }).encode()
+            request = urllib.request.Request(
+                GROQ_URL,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "JustiViz/1.0 (academic research application)",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=25) as response:
+                    body = json.loads(response.read().decode("utf-8", errors="replace"))
+                choice = body.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+                if isinstance(content, str) and content.strip():
+                    parsed = json.loads(content)
+                    structured = validate_hypotheses_payload(parsed)
+                    if structured:
+                        provider = "groq"
+                        hypotheses = [normalize_hypothesis(item, index) for index, item in enumerate(structured)]
+            except Exception:
+                structured = None
+    if not hypotheses:
+        fallback = deterministic_hypotheses(assessment, retrieval, clause_text)
+        if fallback:
+            provider = "deterministic-fallback"
+            hypotheses = fallback
+        else:
+            provider = "deterministic-fallback"
+            hypotheses = [{"id": "hyp-1", "statement": "A evidência disponível é insuficiente para concluir a conformidade ou a contradição da cláusula.", "outcome": "unclear", "article": retrieval.get("category", "Referencial jurídico"), "confidence": 0.35, "evidence_quote": (clause_text or retrieval.get("evidence", ""))[:300], "status": "candidate", "rejection_reason": ""}]
+    for index, item in enumerate(hypotheses):
+        item["id"] = f"hyp-{index + 1}"
+        item["status"] = "candidate"
+        item["rejection_reason"] = ""
+    summary = f"Foram geradas {len(hypotheses)} hipóteses juridicamente relevantes a partir da cláusula e da evidência recuperada."
+    return {
+        "hypotheses": hypotheses,
+        "selected_hypothesis": hypotheses[0],
+        "rejected_hypotheses": [],
+        "steps": [make_step("generate_hypotheses", "Geração de hipóteses jurídicas", summary, state.get("risk_level", "LOW"), 25, {"provider": provider, "source_evidence": {"retrieval": retrieval, "assessment": assessment, "clause_excerpt": clause_text[:800]}, "generated_hypotheses": hypotheses, "state_variables": {"source_document": retrieval.get("source"), "matched_terms": retrieval.get("matched_terms", []), "document_category": retrieval.get("category")}}, [], annotation("generate_hypotheses", summary, clause_text, "As hipóteses foram geradas a partir da evidência legal e do texto da cláusula."), audit(summary, retrieval.get("evidence", "")))]
+    }
+
+
+def selected_hypothesis_score(hypothesis: Hypothesis, findings: list[dict[str, Any]]) -> float:
+    confidence = float(hypothesis.get("confidence", 0.0))
+    article_name = str(hypothesis.get("article", "")).lower()
+    score = confidence
+    for finding in findings:
+        finding_article = str(finding.get("article", "")).lower()
+        if article_name and article_name in finding_article:
+            score += 0.3
+        if str(hypothesis.get("outcome", "")).lower() == str(finding.get("relationship", "")).lower():
+            score += 0.5
+        if str(finding.get("severity", "")).lower() == "strong":
+            score += 0.2
+    return score
+
+
+def evaluate_hypothesis(state: GraphState):
+    hypothesis = dict(state.get("hypothesis") or {})
+    if not hypothesis:
+        return {"evaluated_hypotheses": [], "steps": []}
+    assessment = state["assessment"]
+    retrieval = state["retrieval"]
+    clause_text = state["text"]
+    findings = assessment.get("findings", [])
+    hypothesis_id = str(hypothesis.get("id", "hyp-unknown"))
+    outcome = str(hypothesis.get("outcome", "")).lower()
+    article = str(hypothesis.get("article", "")).strip()
+    rejection_reason = ""
+    strong_conflicts = [item for item in findings if str(item.get("relationship", "")).lower() == "contradicts" and float(item.get("confidence", 0.0)) >= 0.8]
+    strong_supports = [item for item in findings if str(item.get("relationship", "")).lower() == "supports" and float(item.get("confidence", 0.0)) >= 0.8]
+    if outcome == "contradicts" and strong_supports:
+        rejection_reason = "A hipótese contradiz uma conclusão determinística de alta confiança e não é compatível com a evidência recuperada."
+    elif outcome == "supports" and strong_conflicts:
+        rejection_reason = "A hipótese não se sustenta porque há uma contradição legal forte indicada pela avaliação determinística."
+    elif article and retrieval.get("category") and article.lower() not in str(retrieval.get("category", "")).lower() and not any(str(item.get("article", "")).lower() in article.lower() or article.lower() in str(item.get("article", "")).lower() for item in findings):
+        rejection_reason = "O artigo indicado não corresponde ao referencial recuperado nem à evidência legal disponível."
+    elif outcome not in {"supports", "contradicts", "unclear"}:
+        rejection_reason = "A hipótese não é um resultado compatível com a saída esperada de um esquema de avaliação jurídico-evidencial."
+    elif not retrieval.get("evidence") and not clause_text:
+        rejection_reason = "Sem evidência suficiente, a hipótese não pode ser mantida como interpretação viable."
+    if rejection_reason:
+        hypothesis["status"] = "rejected"
+        hypothesis["rejection_reason"] = rejection_reason
+    else:
+        hypothesis["status"] = "candidate"
+        hypothesis["rejection_reason"] = ""
+    summary = f"A hipótese {hypothesis_id} foi avaliada como {'rejeitada' if rejection_reason else 'viável'} com base na evidência legal e no excerto da cláusula."
+    return {"evaluated_hypotheses": [hypothesis], "steps": [make_step("evaluate_hypothesis", f"Avaliação da hipótese {hypothesis_id}", summary, state.get("risk_level", "LOW"), 50, {"hypothesis": hypothesis, "assessment_findings": findings, "rejection_reason": rejection_reason, "state_variables": {"article": article, "outcome": outcome}}, [], annotation("evaluate_hypothesis", summary, clause_text, "A hipótese foi confrontada com a evidência legal recuperada para validar a sua viabilidade."), audit(summary, retrieval.get("evidence", "")))]}
+
+
+def select_hypothesis(state: GraphState):
+    evaluated = state.get("evaluated_hypotheses", []) or []
+    viable = [item for item in evaluated if item.get("status") != "rejected"]
+    rejected = [item for item in evaluated if item.get("status") == "rejected"]
+    findings = state["assessment"].get("findings", [])
+    if viable:
+        selected = max(viable, key=lambda item: selected_hypothesis_score(item, findings))
+        selected["status"] = "selected"
+        selected["rejection_reason"] = ""
+    else:
+        selected = {
+            "id": "hyp-uncertain",
+            "statement": "A informação disponível não permite identificar uma hipótese juridicamente viável com segurança.",
+            "outcome": "unclear",
+            "article": state["retrieval"].get("category", "Referencial jurídico"),
+            "confidence": 0.35,
+            "evidence_quote": (state["text"] or state["retrieval"].get("evidence", ""))[:300],
+            "status": "selected",
+            "rejection_reason": "",
+        }
+    criteria = ["alinhamento com a evidência", "confiança da hipótese", "concordância com achados determinísticos", "relevância do artigo jurídico", "baixa incerteza"]
+    summary = f"A hipótese selecionada foi {selected.get('statement', 'hipótese incerta')} com base em {', '.join(criteria)}."
+    step_payload = {"selected_hypothesis": selected, "rejected_hypotheses": rejected, "rejection_count": len(rejected), "selection_criteria": criteria}
+    return {"selected_hypothesis": selected, "rejected_hypotheses": rejected, "steps": [make_step("select_hypothesis", "Seleção da hipótese mais robusta", summary, state.get("risk_level", "LOW"), 60, step_payload, legacy_alternatives_from_hypotheses(rejected), annotation("select_hypothesis", summary, state["text"], "A hipótese mais sólida foi selecionada com base na evidência e na consistência legal."), audit(summary, state["retrieval"].get("evidence", "")))]}
 
 
 def build_graph():
+    try:
+        from langgraph.constants import Send
+    except Exception:
+        try:
+            from langgraph.types import Send
+        except Exception:
+            Send = None
     graph = StateGraph(GraphState)
 
     def extract(state: GraphState):
@@ -456,26 +777,18 @@ def build_graph():
         risk = assessment["classification"]
         retrieval_name = result.get("retrieval", "tfidf_cosine")
         findings = assessment["findings"]
+        selected_hypothesis = state.get("selected_hypothesis") or {}
+        rejected_hypotheses = state.get("rejected_hypotheses", []) or []
         used_articles = ", ".join(dict.fromkeys(item["article"] for item in findings))
         summary = f"A cláusula foi classificada como {risk} ({score}/100) após comparação com {result.get('category')}. Foram usados: {used_articles}."
-        alternatives = []
-        for finding_index, finding in enumerate(findings):
-            alternatives.append({
-                "id": f"alt-risk-{finding_index + 1}",
-                "hypothesis": "Considerar a cláusula conforme sem aplicar o critério identificado",
-                "rejection_reason": f"A hipótese foi rejeitada porque {finding['explanation']} Artigo utilizado: {finding['article']}.",
-                "confidence_score": round(max(0.05, 1 - finding["confidence"]), 2),
-                "cuad_category": result.get("category"),
-            })
-        alternatives.append({"id": "alt-risk-review", "hypothesis": "Concluir validade definitiva apenas com o excerto analisado", "rejection_reason": "A decisão foi limitada à evidência recuperada e mantém revisão profissional quando existe incerteza ou possível contradição.", "confidence_score": 0.08, "cuad_category": result.get("category")})
-        payload = {"cuad_category_matched": result.get("category"), "confidence_metric": result.get("similarity", 0), "raw_clause_quote": result.get("evidence", ""), "statutory_basis": result.get("statutory_basis"), "legal_findings": findings, "clause_assessment": assessment, "state_variables": {"source_document": result.get("source"), "retrieval": retrieval_name, "matched_terms": result.get("matched_terms", []), "used_articles": used_articles}}
-        return {"risk_score": score, "risk_level": risk, "classification": f"{risk}: {result.get('category')}", "steps": [make_step("classify_risk", f"Classificação de risco: {risk}", summary, risk, 50, payload, alternatives, annotation("classify_risk", summary, state["text"], "A classificação foi ligada à evidência legal recuperada."), audit(summary, result.get("evidence", "")))]}
+        payload = {"cuad_category_matched": result.get("category"), "confidence_metric": result.get("similarity", 0), "raw_clause_quote": result.get("evidence", ""), "statutory_basis": result.get("statutory_basis"), "legal_findings": findings, "clause_assessment": assessment, "selected_hypothesis": selected_hypothesis, "rejected_hypotheses": rejected_hypotheses, "rejection_count": len(rejected_hypotheses), "state_variables": {"source_document": result.get("source"), "retrieval": retrieval_name, "matched_terms": result.get("matched_terms", []), "used_articles": used_articles}}
+        return {"risk_score": score, "risk_level": risk, "classification": f"{risk}: {result.get('category')}", "steps": [make_step("classify_risk", f"Classificação de risco: {risk}", summary, risk, 50, payload, legacy_alternatives_from_hypotheses(rejected_hypotheses), annotation("classify_risk", summary, state["text"], "A classificação foi ligada à evidência legal recuperada."), audit(summary, result.get("evidence", "")))]}
 
     def precedent(state: GraphState):
         findings = state["assessment"]["findings"]
         used_articles = ", ".join(dict.fromkeys(item["article"] for item in findings))
         summary = f"A classificação usou {used_articles} do referencial {state['retrieval'].get('category')}, comparando os respetivos critérios com o excerto da cláusula."
-        payload = {"cuad_category_matched": state["retrieval"].get("category"), "raw_clause_quote": state["retrieval"].get("evidence", ""), "statutory_basis": state["retrieval"].get("statutory_basis"), "legal_findings": findings, "state_variables": {"source_document": state["retrieval"].get("source"), "source_status": state["retrieval"].get("source_status"), "used_articles": used_articles}}
+        payload = {"cuad_category_matched": state["retrieval"].get("category"), "raw_clause_quote": state["retrieval"].get("evidence", ""), "statutory_basis": state["retrieval"].get("statutory_basis"), "legal_findings": findings, "selected_hypothesis": state.get("selected_hypothesis"), "rejected_hypotheses": state.get("rejected_hypotheses", []), "state_variables": {"source_document": state["retrieval"].get("source"), "source_status": state["retrieval"].get("source_status"), "used_articles": used_articles}}
         return {"steps": [make_step("check_precedent", "Referências legais utilizadas", summary, state.get("risk_level", "LOW"), 75, payload, [], annotation("check_precedent", summary, state["text"], "As referências legais foram confrontadas com o texto da cláusula."), audit(summary, state["retrieval"].get("evidence", "")))]}
 
     def faithfulness(state: GraphState):
@@ -483,21 +796,33 @@ def build_graph():
         summary = f"A auditoria comparou a classificação {assessment['classification']} com o texto da cláusula, a evidência legal e os artigos usados, identificando {len(assessment['uncertainty_notes'])} incertezas."
         result = audit(summary, state["retrieval"].get("evidence", ""))
         result["audit_notes"] = f"{result['audit_notes']} Artigos avaliados: {', '.join(dict.fromkeys(item['article'] for item in assessment['findings']))}."
-        return {"faithfulness": result, "steps": [make_step("faithfulness_audit", "Auditoria de fidelidade", summary, state.get("risk_level", "LOW"), 75, {"audit_target": "texto da cláusula, evidência legal e classificação", "audit_provider": "groq" if os.getenv("GROQ_API_KEY") else "local", "legal_findings": assessment["findings"], "state_variables": {"uncertainty_notes": assessment["uncertainty_notes"]}}, [], annotation("faithfulness_audit", summary, state["text"], "A auditoria comparou a narrativa, a evidência e a classificação."), result)]}
+        return {"faithfulness": result, "steps": [make_step("faithfulness_audit", "Auditoria de fidelidade", summary, state.get("risk_level", "LOW"), 75, {"audit_target": "texto da cláusula, evidência legal e classificação", "audit_provider": "groq" if os.getenv("GROQ_API_KEY") else "local", "legal_findings": assessment["findings"], "selected_hypothesis": state.get("selected_hypothesis"), "rejected_hypotheses": state.get("rejected_hypotheses", []), "state_variables": {"uncertainty_notes": assessment["uncertainty_notes"]}}, [], annotation("faithfulness_audit", summary, state["text"], "A auditoria comparou a narrativa, a evidência e a classificação."), result)]}
 
     def verdict(state: GraphState):
         assessment = state["assessment"]
-        summary = f"Veredito fundamentado: a cláusula foi classificada como {assessment['classification']} ({assessment['risk_score']}/100), porque {assessment['findings'][0]['explanation']}"
-        verdict_data = {"risk_score": state.get("risk_score", 20), "classification": state.get("classification", "Sem classificação"), "summary": summary, "eu_ai_act_risk_tier": "High Risk" if state.get("risk_score", 20) >= 65 else "Limited Risk", "recommended_clauses": ["Confirmar o âmbito, a duração e a reciprocidade da disposição."], "mitigation_guidance": "Rever os artigos citados com profissionais do Direito."}
-        return {"verdict": verdict_data, "steps": [make_step("verdict_synthesis", "Síntese do veredito e recomendação", summary, state.get("risk_level", "LOW"), 100, {"final_verdict": verdict_data, "statutory_basis": state["retrieval"].get("statutory_basis")}, [], annotation("verdict_synthesis", summary, state["text"], "Anotação local: a recomendação foi sintetizada para revisão humana."), state.get("faithfulness", audit(summary, state["retrieval"].get("evidence", ""))))]}
+        selected = state.get("selected_hypothesis") or {"statement": "A hipótese selecionada não foi determinável.", "article": state["retrieval"].get("category", "Referencial jurídico"), "confidence": 0.35, "outcome": "unclear"}
+        rejected_hypotheses = state.get("rejected_hypotheses", [])
+        summary = f"Veredito: a hipótese selecionada foi '{selected.get('statement', 'hipótese jurídica')}', porque alinha a evidência legal e a cláusula com a interpretação mais robusta disponível."
+        verdict_data = {"risk_score": state.get("risk_score", assessment.get("risk_score", 20)), "classification": state.get("classification", assessment.get("classification", "Sem classificação")), "summary": summary, "eu_ai_act_risk_tier": "High Risk" if state.get("risk_score", assessment.get("risk_score", 20)) >= 65 else "Limited Risk", "recommended_clauses": ["Confirmar o âmbito, a duração e a reciprocidade da disposição."], "mitigation_guidance": "Rever os artigos citados com profissionais do Direito.", "selected_hypothesis": selected, "rejected_hypotheses": rejected_hypotheses, "rejection_count": len(rejected_hypotheses), "hypotheses": state.get("hypotheses", []), "evaluated_hypotheses": state.get("evaluated_hypotheses", []), "legal_findings": assessment.get("findings", []), "evidence": state["retrieval"].get("evidence", ""), "source": state["retrieval"].get("source")}
+        return {"verdict": verdict_data, "steps": [make_step("verdict_synthesis", "Síntese do veredito e recomendação", summary, state.get("risk_level", "LOW"), 100, {"final_verdict": verdict_data, "statutory_basis": state["retrieval"].get("statutory_basis")}, legacy_alternatives_from_hypotheses(rejected_hypotheses), annotation("verdict_synthesis", summary, state["text"], "Anotação local: a recomendação foi sintetizada para revisão humana."), state.get("faithfulness", audit(summary, state["retrieval"].get("evidence", ""))))]}
 
     graph.add_node("extract_clauses", extract)
+    graph.add_node("generate_hypotheses", generate_hypotheses)
+    graph.add_node("evaluate_hypothesis", evaluate_hypothesis)
+    graph.add_node("select_hypothesis", select_hypothesis)
     graph.add_node("classify_risk", classify)
     graph.add_node("check_precedent", precedent)
     graph.add_node("faithfulness_audit", faithfulness)
     graph.add_node("verdict_synthesis", verdict)
+
     graph.add_edge(START, "extract_clauses")
-    graph.add_edge("extract_clauses", "classify_risk")
+    graph.add_edge("extract_clauses", "generate_hypotheses")
+    if Send is not None:
+        graph.add_conditional_edges("generate_hypotheses", lambda state: [Send("evaluate_hypothesis", {"hypothesis": hypothesis, **state}) for hypothesis in state.get("hypotheses", [])])
+        graph.add_edge("evaluate_hypothesis", "select_hypothesis")
+    else:
+        graph.add_edge("generate_hypotheses", "select_hypothesis")
+    graph.add_edge("select_hypothesis", "classify_risk")
     graph.add_edge("classify_risk", "check_precedent")
     graph.add_edge("check_precedent", "faithfulness_audit")
     graph.add_edge("faithfulness_audit", "verdict_synthesis")
@@ -514,7 +839,26 @@ def invoke_graph(title: str, category: str, text: str) -> dict[str, Any]:
 def make_trace(title: str, category: str, text: str, result: dict[str, Any], trace_suffix: str = "") -> dict[str, Any]:
     trace_id = f"py-langgraph-{abs(hash((title, text)))}{trace_suffix}"
     retrieval = result.get("retrieval", {})
-    return {"trace_id": trace_id, "contract_title": title, "category": category, "cuad_master_category": category, "parties": [], "governing_law": retrieval.get("category", "A determinar por revisão humana"), "contract_excerpt": text[:500], "target_query": f"Avaliar o texto submetido nas categorias: {category}", "steps": result.get("steps", []), "final_verdict": result.get("verdict", {}), "assessment": result.get("assessment", {}), "metadata": {"created_at": "", "model_orchestrator": "langgraph-python", "secondary_auditor_model": "groq" if os.getenv("GROQ_API_KEY") else "local-validation-fallback", "cuad_version": "local-corpus-tfidf", "data_provenance": "live-analysis" if os.getenv("GROQ_API_KEY") else "local-analysis", "legal_source_url": retrieval.get("source"), "legal_source_name": retrieval.get("category"), "legal_source_status": retrieval.get("source_status", "local-corpus")}}
+    verdict = result.get("verdict", {})
+    return {
+        "trace_id": trace_id,
+        "contract_title": title,
+        "category": category,
+        "cuad_master_category": category,
+        "parties": [],
+        "governing_law": retrieval.get("category", "A determinar por revisão humana"),
+        "contract_excerpt": text[:500],
+        "target_query": f"Avaliar o texto submetido nas categorias: {category}",
+        "steps": result.get("steps", []),
+        "final_verdict": verdict,
+        "assessment": result.get("assessment", {}),
+        "hypotheses": result.get("hypotheses", []),
+        "selected_hypothesis": result.get("selected_hypothesis"),
+        "rejected_hypotheses": result.get("rejected_hypotheses", []),
+        "evaluated_hypotheses": result.get("evaluated_hypotheses", []),
+        "rejection_count": len(result.get("rejected_hypotheses", [])),
+        "metadata": {"created_at": "", "model_orchestrator": "langgraph-python", "secondary_auditor_model": "groq" if os.getenv("GROQ_API_KEY") else "local-validation-fallback", "cuad_version": "local-corpus-tfidf", "data_provenance": "live-analysis" if os.getenv("GROQ_API_KEY") else "local-analysis", "legal_source_url": retrieval.get("source"), "legal_source_name": retrieval.get("category"), "legal_source_status": retrieval.get("source_status", "local-corpus")},
+    }
 
 
 def analyze(payload: dict[str, Any]) -> dict[str, Any]:
@@ -523,6 +867,11 @@ def analyze(payload: dict[str, Any]) -> dict[str, Any]:
     text = payload.get("contractText") or ""
     result = invoke_graph(title, category, text)
     base = make_trace(title, category, text, result)
+    base["selected_hypothesis"] = result.get("selected_hypothesis")
+    base["rejected_hypotheses"] = result.get("rejected_hypotheses", [])
+    base["hypotheses"] = result.get("hypotheses", [])
+    base["evaluated_hypotheses"] = result.get("evaluated_hypotheses", [])
+    base["rejection_count"] = len(base["rejected_hypotheses"])
     clauses = segment_contract(text) or [{"index": 0, "title": "Corpo do contrato", "text": text}]
     clause_entries = []
     for index, item in enumerate(clauses):
