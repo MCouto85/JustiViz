@@ -499,8 +499,9 @@ def deterministic_hypotheses(assessment: dict[str, Any], retrieval: dict[str, An
     findings = assessment.get("findings", []) or []
     if not isinstance(findings, list):
         findings = []
-    supports = [item for item in findings if str(item.get("relationship", "")).lower() in {"supports", "unclear"}]
+    supports = [item for item in findings if str(item.get("relationship", "")).lower() == "supports"]
     contradicts = [item for item in findings if str(item.get("relationship", "")).lower() == "contradicts"]
+    unclear = [item for item in findings if str(item.get("relationship", "")).lower() == "unclear"]
     candidates: list[Hypothesis] = []
 
     def make_record(article: str, outcome: str, statement: str, evidence: str, confidence: float) -> Hypothesis:
@@ -518,25 +519,34 @@ def deterministic_hypotheses(assessment: dict[str, Any], retrieval: dict[str, An
     if contradicts:
         for finding in contradicts[:2]:
             clause_quote = (finding.get("contract_excerpt") or finding.get("legal_excerpt") or clause_text).strip()
-            statement = f"A cláusula entra em conflito com o requisito legal em {finding.get('article', retrieval.get('category', 'referencial jurídico'))}."
-            candidates.append(make_record(str(finding.get('article', '')).strip() or retrieval.get('category', 'Referencial jurídico'), 'contradicts', statement, clause_quote[:300], float(finding.get('confidence', 0.7))))
+            article = str(finding.get("article", "")).strip() or retrieval.get("category", "Referencial jurídico")
+            statement = f"A cláusula entra em conflito com o requisito legal em {article}."
+            candidates.append(make_record(article, "contradicts", statement, clause_quote[:300], float(finding.get("confidence", 0.7))))
     if supports:
         for finding in supports[:2]:
             clause_quote = (finding.get("contract_excerpt") or finding.get("legal_excerpt") or clause_text).strip()
-            statement = f"A cláusula pode ser interpretada como compatível com {finding.get('article', retrieval.get('category', 'referencial jurídico'))}."
-            candidates.append(make_record(str(finding.get('article', '')).strip() or retrieval.get('category', 'Referencial jurídico'), 'supports', statement, clause_quote[:300], float(finding.get('confidence', 0.6))))
-    if not candidates and findings:
+            article = str(finding.get("article", "")).strip() or retrieval.get("category", "Referencial jurídico")
+            statement = f"A cláusula pode ser interpretada como compatível com {article}, conforme o excerto e o referencial disponibilizado."
+            candidates.append(make_record(article, "supports", statement, clause_quote[:300], float(finding.get("confidence", 0.6))))
+    if len(candidates) < 2 and unclear:
+        first = unclear[0]
+        article = str(first.get("article", "")).strip() or retrieval.get("category", "Referencial jurídico")
+        clause_quote = (first.get("contract_excerpt") or first.get("legal_excerpt") or clause_text).strip()
+        candidates.append(make_record(article, "unclear", "A evidência disponibile é insuficiente para concluir com segurança sobre a conformidade ou a incompatibilidade da cláusula.", clause_quote[:300], max(0.25, float(first.get("confidence", 0.35)))))
+    if len(candidates) < 2 and findings:
         first = findings[0]
-        candidates.append(make_record(str(first.get('article', '')).strip() or retrieval.get('category', 'Referencial jurídico'), 'unclear', "A evidência disponível é insuficiente para afirmar com segurança a conformidade ou a incompatibilidade da cláusula.", str(first.get('contract_excerpt') or first.get('legal_excerpt') or clause_text)[:300], max(0.25, float(first.get('confidence', 0.35)))))
+        article = str(first.get("article", "")).strip() or retrieval.get("category", "Referencial jurídico")
+        clause_quote = (first.get("contract_excerpt") or first.get("legal_excerpt") or clause_text).strip()
+        candidates.append(make_record(article, "unclear", "A interpretação jurídica permanece incerta porque o excerto e a evidência disponível não permitem concluir de forma firme.", clause_quote[:300], max(0.25, float(first.get("confidence", 0.35)))))
     if not candidates:
-        article = retrieval.get('category', 'Referencial jurídico')
+        article = retrieval.get("category", "Referencial jurídico")
         candidates.append({
             "id": "",
             "statement": "A evidência disponível é insuficiente para concluir a conformidade ou a contradição da cláusula.",
             "outcome": "unclear",
             "article": article,
             "confidence": 0.35,
-            "evidence_quote": (clause_text or retrieval.get('evidence', ''))[:300],
+            "evidence_quote": (clause_text or retrieval.get("evidence", ""))[:300],
             "status": "candidate",
             "rejection_reason": "",
         })
@@ -552,6 +562,76 @@ def deterministic_hypotheses(assessment: dict[str, Any], retrieval: dict[str, An
         item["status"] = "candidate"
         deduped.append(item)
     return deduped[:5]
+
+
+def structured_hypotheses_call(key: str, retrieval: dict[str, Any], assessment: dict[str, Any], clause_text: str) -> list[dict[str, Any]]:
+    schema = {
+        "type": "object",
+        "properties": {
+            "hypotheses": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "statement": {"type": "string", "minLength": 1, "maxLength": 400},
+                        "outcome": {"enum": ["supports", "contradicts", "unclear"]},
+                        "article": {"type": "string", "minLength": 1, "maxLength": 200},
+                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                        "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 500},
+                    },
+                    "required": ["statement", "outcome", "article", "confidence", "evidence_quote"],
+                    "additionalProperties": False,
+                },
+                "minItems": 1,
+                "maxItems": 5,
+            }
+        },
+        "required": ["hypotheses"],
+        "additionalProperties": False,
+    }
+    prompt = (
+        "Analise esta cláusula e os elementos jurídicos disponíveis. "
+        "Use apenas a evidência fornecida e mantenha a resposta concisa e verificável.\n\n"
+        f"Cláusula: {clause_text[:2000]}\n\n"
+        f"Categoria: {retrieval.get('category', 'Referencial jurídico')}\n"
+        f"Evidência legal: {retrieval.get('evidence', '')[:1500]}\n\n"
+        f"Achados determinísticos: {json.dumps(assessment.get('findings', [])[:3], ensure_ascii=False)[:2500]}"
+    )
+    payload = json.dumps({
+        "model": GROQ_MODEL,
+        "temperature": 0.1,
+        "max_tokens": 500,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "hypothesis_set", "schema": schema, "strict": True}},
+        "messages": [
+            {"role": "system", "content": "Generates only plausible legal hypotheses grounded in the clause and supplied evidence. Do not invent alternatives solely for visual demonstration. Do not expose hidden reasoning or chain-of-thought. Return concise, auditable hypotheses linked to the supplied clause, article, and evidence. Include a conformity hypothesis only if genuinely plausible. Include a contradiction hypothesis only if genuinely plausible. Include an uncertainty hypothesis when the supplied information is insufficient. Return between 2 and 5 hypotheses when more than one interpretation is genuinely supported; otherwise return fewer."},
+            {"role": "user", "content": prompt},
+        ],
+    }).encode()
+    request = urllib.request.Request(
+        GROQ_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "JustiViz/1.0 (academic research application)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            body = json.loads(response.read().decode("utf-8", errors="replace"))
+        choice = body.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        content = message.get("content")
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        if isinstance(content, str) and content.strip():
+            parsed = json.loads(content)
+            return validate_hypotheses_payload(parsed)
+    except Exception:
+        pass
+    return []
 
 
 def normalize_hypothesis(item: dict[str, Any], index: int) -> Hypothesis:
@@ -584,79 +664,14 @@ def generate_hypotheses(state: GraphState):
     clause_text = state["text"]
     provider = "deterministic-fallback"
     hypotheses: list[Hypothesis] = []
-    if os.getenv("GROQ_API_KEY"):
-        structured = None
-        key = os.getenv("GROQ_API_KEY")
-        if key:
-            schema = {
-                "type": "object",
-                "properties": {
-                    "hypotheses": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "statement": {"type": "string", "minLength": 1, "maxLength": 400},
-                                "outcome": {"enum": ["supports", "contradicts", "unclear"]},
-                                "article": {"type": "string", "minLength": 1, "maxLength": 200},
-                                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                                "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 500},
-                            },
-                            "required": ["statement", "outcome", "article", "confidence", "evidence_quote"],
-                            "additionalProperties": False,
-                        },
-                        "minItems": 1,
-                        "maxItems": 5,
-                    }
-                },
-                "required": ["hypotheses"],
-                "additionalProperties": False,
-            }
-            prompt = (
-                "Analise esta cláusula e os elementos jurídicos disponíveis. "
-                "Use apenas a evidência fornecida e mantenha a resposta concisa e verificável.\n\n"
-                f"Cláusula: {clause_text[:2000]}\n\n"
-                f"Categoria: {retrieval.get('category', 'Referencial jurídico')}\n"
-                f"Evidência legal: {retrieval.get('evidence', '')[:1500]}\n\n"
-                f"Achados determinísticos: {json.dumps(assessment.get('findings', [])[:3], ensure_ascii=False)[:2500]}"
-            )
-            payload = json.dumps({
-                "model": GROQ_MODEL,
-                "temperature": 0.1,
-                "max_tokens": 500,
-                "response_format": {"type": "json_schema", "json_schema": {"name": "hypothesis_set", "schema": schema, "strict": True}},
-                "messages": [
-                    {"role": "system", "content": "Generates only plausible legal hypotheses grounded in the clause and supplied evidence. Do not invent alternatives solely for visual demonstration. Do not expose hidden reasoning or chain-of-thought. Return concise, auditable hypotheses linked to the supplied clause, article, and evidence. Include a conformity hypothesis only if genuinely plausible. Include a contradiction hypothesis only if genuinely plausible. Include an uncertainty hypothesis when the supplied information is insufficient. Return between 2 and 5 hypotheses when more than one interpretation is genuinely supported; otherwise return fewer."},
-                    {"role": "user", "content": prompt},
-                ],
-            }).encode()
-            request = urllib.request.Request(
-                GROQ_URL,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                    "User-Agent": "JustiViz/1.0 (academic research application)",
-                },
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=25) as response:
-                    body = json.loads(response.read().decode("utf-8", errors="replace"))
-                choice = body.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                content = message.get("content")
-                if isinstance(content, list):
-                    content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-                if isinstance(content, str) and content.strip():
-                    parsed = json.loads(content)
-                    structured = validate_hypotheses_payload(parsed)
-                    if structured:
-                        provider = "groq"
-                        hypotheses = [normalize_hypothesis(item, index) for index, item in enumerate(structured)]
-            except Exception:
-                structured = None
+    api_key = os.getenv("GROQ_API_KEY")
+
+    if api_key:
+        structured = structured_hypotheses_call(api_key, retrieval, assessment, clause_text)
+        if structured:
+            provider = "groq"
+            hypotheses = [normalize_hypothesis(item, index) for index, item in enumerate(structured)]
+
     if not hypotheses:
         fallback = deterministic_hypotheses(assessment, retrieval, clause_text)
         if fallback:
@@ -713,6 +728,8 @@ def evaluate_hypothesis(state: GraphState):
         rejection_reason = "A hipótese não se sustenta porque há uma contradição legal forte indicada pela avaliação determinística."
     elif article and retrieval.get("category") and article.lower() not in str(retrieval.get("category", "")).lower() and not any(str(item.get("article", "")).lower() in article.lower() or article.lower() in str(item.get("article", "")).lower() for item in findings):
         rejection_reason = "O artigo indicado não corresponde ao referencial recuperado nem à evidência legal disponível."
+    elif outcome == "unclear" and strong_conflicts and not strong_supports:
+        rejection_reason = "A hipótese de incerteza não é suficientemente informada para sobreviver quando a avaliação determinística indica uma contradição forte."
     elif outcome not in {"supports", "contradicts", "unclear"}:
         rejection_reason = "A hipótese não é um resultado compatível com a saída esperada de um esquema de avaliação jurídico-evidencial."
     elif not retrieval.get("evidence") and not clause_text:
@@ -732,8 +749,14 @@ def select_hypothesis(state: GraphState):
     viable = [item for item in evaluated if item.get("status") != "rejected"]
     rejected = [item for item in evaluated if item.get("status") == "rejected"]
     findings = state["assessment"].get("findings", [])
+
     if viable:
         selected = max(viable, key=lambda item: selected_hypothesis_score(item, findings))
+        non_selected = [item for item in viable if item.get("id") != selected.get("id")]
+        for item in non_selected:
+            item["status"] = "rejected"
+            item["rejection_reason"] = "A hipótese foi rejeitada porque uma hipótese melhor alinhada com a evidência legal e com os achados determinísticos prevaleceu."
+        rejected = [*rejected, *non_selected]
         selected["status"] = "selected"
         selected["rejection_reason"] = ""
     else:
@@ -836,10 +859,48 @@ def invoke_graph(title: str, category: str, text: str) -> dict[str, Any]:
     return build_graph().invoke({"title": title, "category": category, "text": text, "retrieval": retrieval, "assessment": assessment, "steps": []})
 
 
+PUBLIC_GRAPH_NODE_NAMES = {"extract_clauses", "classify_risk", "check_precedent", "faithfulness_audit", "verdict_synthesis"}
+
+
+def public_graph_steps(result: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = result.get("steps", []) or []
+    public_steps: list[dict[str, Any]] = []
+    rejected = result.get("rejected_hypotheses", []) or []
+    alternatives = legacy_alternatives_from_hypotheses(rejected)
+
+    for step in steps:
+        node_name = step.get("node_name")
+        if node_name not in PUBLIC_GRAPH_NODE_NAMES:
+            continue
+        public_step = dict(step)
+        if node_name == "classify_risk":
+            public_step["alternatives"] = alternatives
+            payload = dict(public_step.get("payload") or {})
+            payload["selected_hypothesis"] = result.get("selected_hypothesis")
+            payload["rejected_hypotheses"] = rejected
+            payload["rejection_count"] = len(rejected)
+            public_step["payload"] = payload
+        else:
+            public_step["alternatives"] = []
+        public_steps.append(public_step)
+
+    # Preserve the historical public graph layout while keeping internal evaluation logic intact.
+    ordered_names = ["extract_clauses", "classify_risk", "check_precedent", "faithfulness_audit", "verdict_synthesis"]
+    filtered: list[dict[str, Any]] = []
+    for name in ordered_names:
+        for step in public_steps:
+            if step.get("node_name") == name:
+                filtered.append(step)
+                break
+    return filtered
+
+
 def make_trace(title: str, category: str, text: str, result: dict[str, Any], trace_suffix: str = "") -> dict[str, Any]:
     trace_id = f"py-langgraph-{abs(hash((title, text)))}{trace_suffix}"
     retrieval = result.get("retrieval", {})
     verdict = result.get("verdict", {})
+    public_steps = public_graph_steps(result)
+    rejected_hypotheses = result.get("rejected_hypotheses", []) or []
     return {
         "trace_id": trace_id,
         "contract_title": title,
@@ -849,14 +910,14 @@ def make_trace(title: str, category: str, text: str, result: dict[str, Any], tra
         "governing_law": retrieval.get("category", "A determinar por revisão humana"),
         "contract_excerpt": text[:500],
         "target_query": f"Avaliar o texto submetido nas categorias: {category}",
-        "steps": result.get("steps", []),
+        "steps": public_steps,
         "final_verdict": verdict,
         "assessment": result.get("assessment", {}),
         "hypotheses": result.get("hypotheses", []),
         "selected_hypothesis": result.get("selected_hypothesis"),
-        "rejected_hypotheses": result.get("rejected_hypotheses", []),
+        "rejected_hypotheses": rejected_hypotheses,
         "evaluated_hypotheses": result.get("evaluated_hypotheses", []),
-        "rejection_count": len(result.get("rejected_hypotheses", [])),
+        "rejection_count": len(rejected_hypotheses),
         "metadata": {"created_at": "", "model_orchestrator": "langgraph-python", "secondary_auditor_model": "groq" if os.getenv("GROQ_API_KEY") else "local-validation-fallback", "cuad_version": "local-corpus-tfidf", "data_provenance": "live-analysis" if os.getenv("GROQ_API_KEY") else "local-analysis", "legal_source_url": retrieval.get("source"), "legal_source_name": retrieval.get("category"), "legal_source_status": retrieval.get("source_status", "local-corpus")},
     }
 

@@ -290,6 +290,25 @@ def test_evaluated_hypotheses_are_accumulated_instead_of_overwritten(monkeypatch
     assert graph_result['selected_hypothesis']['id'] in {item['id'] for item in graph_result['evaluated_hypotheses']}
 
 
+def test_public_trace_keeps_only_original_five_nodes_with_forked_rejections(monkeypatch):
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
+    result = langgraph_service.build_graph().invoke({
+        'title': 'Grafo público',
+        'category': 'RGPD (Regulamento UE 2016/679)',
+        'text': 'O subcontratante notificará a violação no prazo de 45 dias.',
+        'retrieval': langgraph_service.retrieve_legal_framework('O subcontratante notificará a violação no prazo de 45 dias.', 'RGPD (Regulamento UE 2016/679)'),
+        'assessment': langgraph_service.assess_clause('O subcontratante notificará a violação no prazo de 45 dias.', langgraph_service.retrieve_legal_framework('O subcontratante notificará a violação no prazo de 45 dias.', 'RGPD (Regulamento UE 2016/679)')),
+        'steps': [],
+    })
+    trace = langgraph_service.make_trace('Grafo público', 'RGPD (Regulamento UE 2016/679)', 'O subcontratante notificará a violação no prazo de 45 dias.', result)
+
+    visible_nodes = {step['node_name'] for step in trace['steps']}
+    assert visible_nodes <= {'extract_clauses', 'classify_risk', 'check_precedent', 'faithfulness_audit', 'verdict_synthesis'}
+    assert len(visible_nodes) <= 5
+    assert any(step['node_name'] == 'classify_risk' and step['alternatives'] for step in trace['steps'])
+    assert trace['rejected_hypotheses']
+
+
 def test_final_verdict_and_step_payload_do_not_include_synthetic_alternatives(monkeypatch):
     monkeypatch.delenv('GROQ_API_KEY', raising=False)
     trace = analyze({
