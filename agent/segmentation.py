@@ -10,7 +10,7 @@ def segment_contract(contract_text: str) -> List[Dict[str, Any]]:
         return []
 
     pattern = re.compile(
-        r"(?:^|\n\s*)(?:SECTION|CLAUSE|ARTICLE|\d+\.?\s+[A-Z][A-Z0-9\s&/\-]*)",
+        r"(?:^|\n\s*)(?:SECTION|CLAUSE|CLÁUSULA|CLAUSULA|ARTICLE|\d+\.?\s+[A-ZÁÉÍÓÚ][A-ZÁÉÍÓÚ0-9\s&/\-]*)",
         re.IGNORECASE,
     )
     matches = list(pattern.finditer(text))
